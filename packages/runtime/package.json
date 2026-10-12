@@ -1,0 +1,50 @@
+{
+  "name": "@lyd123qw2008/dsh-ptc-runtime",
+  "version": "0.1.0",
+  "description": "PTC-shaped capability runtime: no persistent JS kernel, any MCP server as a capability catalog, execution via DSH ctx.ptcRuntime",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "!dist/*.tsbuildinfo",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "keywords": [
+    "ptc",
+    "mcp",
+    "model-context-protocol",
+    "code-mode",
+    "capability-runtime",
+    "dsh",
+    "deepseek-harness"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/client": "2.0.0"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/server": "2.0.0",
+    "@types/node": "^22.20.0",
+    "vitest": "^4.1.8",
+    "zod": "4.2.0"
+  }
+}

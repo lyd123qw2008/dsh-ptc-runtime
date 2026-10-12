@@ -1,0 +1,31 @@
+# Mounts the PTC bootstrap. Provider configuration is machine-local and therefore NOT
+# here: a profile supplies it by inserting its own row with the SAME id, which replaces
+# this one. Mirrors node-repl-runtime's bundle, where the pattern comes from.
+#
+# With `providers` omitted, `resolveProviders` falls through to `PTC_CAP_PROVIDERS`
+# (inline JSON) and then `PTC_CAP_PROVIDERS_FILE`. Pinning `providers: []` here would
+# short-circuit that fallback and permanently hold every profile at zero.
+#
+# The row must sit inside `insert:`. A bare top-level entry is a PATCH, and an unknown
+# patch target is warned and skipped -- stated in the `entryList` description in
+# @deepseek-ai/dsh-app-boot's config-schema/document.ts -- so it mounted nothing and
+# every `--dump-config` reported:
+#
+#   dsh: [@lyd123qw2008/dsh-ptc-dsh-bootstrap] patch: entry "dsh-ptc-runtime-bootstrap" not found
+#
+# An earlier version of this file claimed that wrapping the row in `insert:` would
+# MOUNT IT TWICE, because a `--patch` overlay carrying a second row of the same id
+# produced two entries in `--dump-config`. That inference was wrong: two entries in the
+# composed DOCUMENT are not two mounts. Measured 2026-10-12 -- the web profile's tree
+# carries two `- id: node-repl-runtime-bootstrap` entries (exactly this pattern, from
+# node-repl's own bundle) while its boot log prints ONE `[node-repl-runtime] mounted …`
+# line listing the configured providers. The later same-id entry REPLACES the earlier
+# one; it is not a second mount.
+#
+# The duplicate that DOES matter is a row under a DIFFERENT id. Two runtimes attaching
+# the same stdio MCP server means two child processes, and for engram that corrupts the
+# search index silently -- which is why the PTC row and the kernel row in
+# profiles/web/cordis.patch.yml must never both attach it. See the note there.
+- insert:
+    - id: dsh-ptc-runtime-bootstrap
+      name: '@lyd123qw2008/dsh-ptc-dsh-bootstrap'
