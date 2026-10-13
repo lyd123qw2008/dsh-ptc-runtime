@@ -65,10 +65,68 @@ M1（不依赖真实 DSH，hermetic）：工具面 token ≤1200；三级寻址 
 
 M2（挂真实 preset，`mode: both`）：重跑 EXPERIMENT 三臂——head 回到 60s 内、输出 token 回到 5k 内、截 3 进 1 正确、9 条 dispatch 记录保留。
 
-**2026-10-13 已跑 M1**：`pnpm run verify` 全绿，65 个测试（runtime 38 / adapter-dsh 22 / dsh-bootstrap 5）。
+**2026-10-13 已跑 M1**：`pnpm run verify` 全绿，80 个测试（runtime 53 / adapter-dsh 22 / dsh-bootstrap 5）。
 每个修复都用"改回旧实现跑一遍"证明测试确实能抓到该 bug，而不是只证明它通过。
 
-## 4.1 生命周期：`refresh` 与卸载（2026-10-13 修）
+## 4.1 性能（2026-10-13 测）
+
+复现：`node scripts/bench-payload.mjs`、`node scripts/bench-program.mjs`、`node scripts/bench-scaling.mjs`、`node scripts/bench-equivalence.mjs`（node v24.13.0）。
+
+### 先量比例，再决定优化什么
+一个 20 次调用的程序（1 次 150 KB 结构化回复 + 1 张 200 KB 截图 + 18 次小回复）在 `runDirect` 上耗时 **1.20ms**；而 `ctx.ptcRuntime` 每程序起一个子进程的底座是 **~200ms**（§5）。即**本进程内的全部开销约占一次程序运行的 0.6%**。
+结论：本包没有值得追的"热点"，优化只能做**常数因子**，且必须便宜、零风险。
+
+### 复杂度：已确认线性，无算法缺陷
+`toLosslessJson` 与 `toResultBlocks`(metadata-only) 在 100 KB → 4 MB 上，时间翻倍比 ≈ **2.00**、每 KB 微秒数基本持平（1.9–2.1 / 3.3–3.6 µs/KB）。没有 O(n²) 路径，所以不存在"大回复会爆炸"的风险。
+
+### 基线 → 优化后（median，n=200）
+
+| 场景 | 优化前 | 优化后 | 变化 |
+|---|---:|---:|---:|
+| `toLosslessJson` 150 KB（IDEA 实测量级） | 0.296ms | **0.134ms** | **−55%** |
+| `toLosslessJson` 1 MB | 1.999ms | **0.862ms** | **−57%** |
+| `toResultBlocks` 截图 metadata-only 500 KB | 1.795ms | **1.170ms** | **−35%** |
+| 20 次调用程序合计 | 1.593ms | **1.202ms** | **−25%** |
+
+### 改了两处，都是常数因子且**逐字节等价**
+
+1. **`crypto.hash` 取代 `createHash().update().digest()`**（`ptc.ts` 图片指纹）。
+   `metadata-only` 截图的开销**几乎全是那一次 sha256**：实测该场景 1.795ms，而单独 hash 是 1.797ms —— 即哈希占 ~100%。换成 `crypto.hash('sha256', s, 'hex')` 输出**完全相同**（1 B / 999 B / 100 KB / 500 KB / 1 MB 五档比对一致），快 ~26%。
+   注意 `digest().toString('hex',0,8)` 并不更快（1.781ms），只有 `crypto.hash` 有收益。
+
+2. **`toLosslessJson` 改写时复制（copy-on-write）**（`ptc.ts`）。
+   原实现**总是**重建整棵对象树。但 provider 回复是经 `JSON.parse` 来的，**绝大多数本来就无损**，重建一个完全相同的图是纯开销。现在先做一次"是否需要改"的校验（命中即返回原对象，零分配），只有真的遇到 `Infinity`/`-0`/`undefined` 属性/稀疏数组/函数/环才走第二遍重建；重建时**未被改动的分支按引用共享**，不深拷贝。
+   校验函数特意用**返回 `false` 表示"需要重写"**，包括 `Date` 这类 `toJSON` 载体 —— 早期写成"有 `toJSON` 就返回 true"会让 `Date` 对象原样留下，被宿主闸门拒（由 `tests/lossless-copy.test.ts` 的 Date 用例抓到，已修）。
+
+### 等价性证据
+`node scripts/bench-equivalence.mjs` 逐项比对：哈希五档一致；`toLosslessJson` 对 19 个用例（含 NaN/±Infinity/-0/稀疏数组/Date/函数/环/空容器/500 元素数组/混合恶意值）与**旧的总是拷贝实现深度相等**；`toResultBlocks` 块顺序与哈希值不变。**结论：只快了，输出没变。**
+
+### 分配量（确定性证据，非 heapUsed）
+`node scripts/bench-memory.mjs` 统计 20 次调用产生的**不同对象数**：旧实现 `20 of 20`（每次一个新副本），新实现 `1 of 20`（全部共享输入对象本身），三档 payload 均如此。
+> 早先版本用 `heapUsed` 增长做证据，**结论不可靠**：GC 时机主导读数，980 KB 那一档甚至出现新实现"更费"的反常值。改成数不同对象后结论变得确定、可复现。
+
+### 明确没做的事（以及为什么）
+- **没改哈希算法**：`hash` 在文档里是"比大小用的指纹，不是校验和"（§3），但改算法会改掉所有已报告的值。收益（`crypto.hash`）已经在**不改输出**的前提下拿到了，没必要动语义。
+- **没引入 worker/异步化**：0.6% 的比例，加了只会增加复杂度和失败面。
+- **没为 `toLosslessJson` 加"跳过已校验"缓存**：同一对象只过一次，缓存无收益。
+
+### 另一个（更重要的）维度：模型上下文成本
+墙钟不是唯一成本。两个工具**每次请求**都要声明，所以描述与参数 schema 里的每个 token 都是**反复付费**的（对比：本包的存在理由就是省这个）。`node scripts/bench-tokens.mjs`：
+
+| 项 | token |
+|---|---:|
+| `cap_help` | 433 |
+| `cap_call` | 750 |
+| **合计** | **1183** |
+| M1 预算 | 1200 |
+| **余量** | **17** |
+
+- **只剩 17 token 余量**，而这是**每次请求**都付的。任何一次描述扩写都可能顶破 M1。
+- **已修的测试缺口**：`face.test.ts` 原本断言 `<= 1600`，比文档承诺的 M1（1200）松 33% —— 从 1183 涨到 1300 会**通过测试但违反 M1**。已改为断言 1200，并验证过"人为放宽预算到 1000 时该用例会失败"。
+- **面是平的**：挂 50 个 provider × 100 个 operation 后仍是 **1183**，增长 **0** token。对比"一个 operation 一个声明"的直接投影：25 op 就要 7075（6.0×），100 op 要 28300（23.9×），480 op 要 135900（114.9×）。这个"不随目录增长"的性质正是本包存在的价值。
+- 内核面（`js` + `js_reset`）的**精确** token 数没有测：脚本对它只做了"源码里引号字符串总长 / 4"的粗提取，与上表逐字段估算**口径不同**，不可直接比较。要对比得用同一口径重测，本次没做。
+
+## 4.2 生命周期：`refresh` 与卸载（2026-10-13 修）
 
 - **`cap_help({refresh:true})` 曾把目录里所有 provider 打死**：原实现 close 旧连接 → build 新 runtime → `Object.assign(runtime, {catalog: rebuilt.catalog})` 按引用搬运 → `void rebuilt.dispose()`。而 `catalog` 闭包引用的是 **rebuilt 自己的** providers Map，所以 `dispose()` 关掉的正是**刚接管过来的连接**。实测：refresh 前 `cap_call` 返回 `gen1`，refresh 后同一个调用抛 `provider p has no open session`，而 `cap_help` 仍把该 provider 列在目录里 —— 显示可用、实际全挂。修法：用 `let current` 持有活动 runtime，refresh 时 `current = rebuilt; await previous.dispose()`，即**dispose 出局的那个，不是入局的那个**。
 - **卸载时曾泄漏 stdio 子进程**：`ctx.effect` 的清理函数只反注册 `cap_help`/`cap_call`，从不 `dispose()` runtime，provider 子进程会活到宿主进程结束。已在清理函数里补 `void current.dispose()`。
@@ -100,5 +158,5 @@ M2（挂真实 preset，`mode: both`）：重跑 EXPERIMENT 三臂——head 回
 
 ## 6.1 其余注意点
 
-1. `dsh-bootstrap` 此前**没有测试目录**（`--passWithNoTests`），所以 §4.1 的 refresh 路径曾零覆盖；本次已补 `tests/lifecycle.test.ts`。
+1. `dsh-bootstrap` 此前**没有测试目录**（`--passWithNoTests`），所以 §4.2 的 refresh 路径曾零覆盖；本次已补 `tests/lifecycle.test.ts`。
 2. `ProviderImages` 增 `indexes` 是**破坏性变更**（公开导出类型加了必填字段）。若有外部消费者需同步。

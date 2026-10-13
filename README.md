@@ -55,3 +55,19 @@ pnpm install
 pnpm run verify   # check + test
 pnpm run build
 ```
+
+## 性能
+
+先 `pnpm run build`（脚本读 `dist/`），再：
+
+```bash
+node scripts/bench-payload.mjs        # 本包对 provider 回复做的加工（映射块 + 归一 data）
+node scripts/bench-program.mjs        # 一次真实形态的程序运行（runDirect 端到端）
+node scripts/bench-scaling.mjs        # 复杂度检查：确认是线性而非 O(n²)
+node scripts/bench-equivalence.mjs    # 等价性：证明优化只改速度、不改输出
+node scripts/bench-memory.mjs         # 分配量：copy-on-write 省掉的重复对象图
+node scripts/bench-tokens.mjs         # 模型上下文成本（每次请求都付）
+```
+
+测的是**本仓库的进程内开销**，不含 provider 本身、进程启动与 MCP 传输。比例上它只占一次程序运行的
+~0.6%（每程序子进程底座 ~200ms，见 DESIGN §5），结论与数据见 [DESIGN §4.1](DESIGN.md)。

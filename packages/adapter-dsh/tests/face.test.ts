@@ -54,7 +54,12 @@ describe('the two-tool face', () => {
   it('stays exactly two tools inside the declaration budget', () => {
     expect(tools.map(tool => tool.name)).toEqual([...CAP_TOOL_NAMES])
     const tokens = estimatedToolsTokens(tools.map(tool => ({ name: tool.name, description: tool.description, parameters: tool.parameters })))
-    expect(tokens).toBeLessThanOrEqual(1600)
+    // The M1 budget (DESIGN §4) is 1200. This assertion used to say 1600, which is
+    // 33% looser than the documented budget: a regression from the current 1183 to
+    // 1300 would have passed the test while violating M1. Assert what the design
+    // actually promises. Measured 2026-10-13 by `node scripts/bench-tokens.mjs`:
+    // 1183 total (cap_help 433, cap_call 750) — 17 tokens of headroom.
+    expect(tokens).toBeLessThanOrEqual(1200)
   })
 
   it('lists providers and failed attaches at the first level', async () => {
