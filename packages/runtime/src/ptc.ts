@@ -6,17 +6,22 @@
  * host (`catalog.ts`), and each program run is one-shot — providers are called
  * directly, results are mapped to blocks, and nothing survives the run.
  *
- * Two execution paths, chosen by the caller:
- *   - `runDirect`: call providers straight from the host (native presentation).
+ * Two execution paths exist, but only the first is wired today:
+ *   - `runDirect` — call providers straight from the host (native presentation).
  *     Each `PtcProgramCall` becomes one provider call; `deliver` decides whether
  *     an image-bearing result enters the conversation or returns metadata only.
- *   - `buildProgram`: render the program source a `ctx.ptcRuntime` run would
- *     execute (PTC presentation). The program awaits the same bindings several
- *     times, keeping every sub-call visible to the harness as `tool/ptc-dispatch`.
+ *     **This is the path the mounted `cap_help`/`cap_call` face uses.**
+ *   - `buildProgram` — render the program source a `ctx.ptcRuntime` run would
+ *     execute (PTC presentation), keeping every sub-call visible to the harness
+ *     as `tool/ptc-dispatch`. It has **no production caller**: it is the reserved
+ *     second path, kept because the presentation work is planned (DESIGN §5.3
+ *     `presentationMeta`) and the shape is already decided. Only `renderProgram`
+ *     and the CLI reach it. Stated here so it does not read as live.
  */
 
 import { createHash } from 'node:crypto'
 import { collectProviderImages } from './catalog.js'
+import type { ProviderImage } from './catalog.js'
 import type {
   McpProviderSpec,
   ProviderConnection,
@@ -87,6 +92,12 @@ function imageAttachmentName(mediaType: string): string {
  * sizes without paying context for pixels. The file-argument detour is never
  * needed — and must not be used, since a file lands in the provider process
  * cwd (the deployment profile), not the session workspace.
+ *
+ * `imageOmission` is for a route that cannot receive images at all (a text-only
+ * model). Every image block becomes that text and **nothing is written to the
+ * attachment store**: delivering pixels only to rewrite the block afterwards
+ * persisted images no model could ever read, and the store never deletes them
+ * (measured: `saveImages` was still called once on a text-only route).
  */
 export async function toResultBlocks(
   host: PtcHost,
@@ -94,6 +105,7 @@ export async function toResultBlocks(
   operation: string,
   result: unknown,
   deliver: 'inline' | 'metadata-only',
+  imageOmission?: string,
 ): Promise<readonly PtcResultBlock[]> {
   if (result === null || typeof result !== 'object') {
     return [{ kind: 'text', text: JSON.stringify(result ?? null) }]
@@ -144,42 +156,72 @@ export async function toResultBlocks(
   // only `content` cannot see what the kernel's cell could.
   const blocks: PtcResultBlock[] = []
   const admitted = collectProviderImages(content)
+  // Source index -> position in `admitted.images`. The two counters differ the moment
+  // admission refuses a block, so a position-based lookup would hand a refused block its
+  // neighbour's image (measured: a dropped GIF received the admitted PNG's hash and, in
+  // the inline arm, its attachment). Keyed by source index, every block resolves to its
+  // own image or to none.
+  const admittedByIndex = new Map<number, { image: ProviderImage; position: number }>()
+  admitted.indexes.forEach((sourceIndex, position) => {
+    const image = admitted.images[position]
+    if (image !== undefined) admittedByIndex.set(sourceIndex, { image, position })
+  })
   let refs: readonly PtcImageRef[] = []
-  if (admitted.images.length > 0 && deliver === 'inline' && host.saveImages !== undefined) {
-    refs = await host.saveImages(admitted.images.map(image => ({
-      data: Buffer.from(image.data, 'base64'),
-      mediaType: image.mimeType,
-      name: imageAttachmentName(image.mimeType),
-    })))
+  // Nothing is stored when the route refuses images outright: the pixels would be
+  // written to a durable store that no model can read from and nothing prunes.
+  const storesImages = imageOmission === undefined && deliver === 'inline' && host.saveImages !== undefined
+  if (admitted.images.length > 0 && storesImages) {
+    // A store failure degrades the image, it does not fail the call. The reply's
+    // TEXT is the part the model came for — "Took a screenshot." or a provider's
+    // error prose — and letting a storage fault throw here discarded all of it
+    // (measured: "whole call failed, text LOST"). `refs` stays empty and each
+    // admitted image becomes the "not stored" placeholder below instead.
+    try {
+      refs = await host.saveImages(admitted.images.map(image => ({
+        data: Buffer.from(image.data, 'base64'),
+        mediaType: image.mimeType,
+        name: imageAttachmentName(image.mimeType),
+      })))
+    } catch {
+      refs = []
+    }
   }
-  let imageIndex = 0
-  for (const block of content) {
+  for (let index = 0; index < content.length; index++) {
+    const block = content[index]
     if (block?.type === 'text') {
       blocks.push({ kind: 'text', text: String(block.text ?? '') })
       continue
     }
     if (block?.type !== 'image') continue
-    const admittedImage = admitted.images[imageIndex]
-    imageIndex++
+    if (imageOmission !== undefined) {
+      // The refusal is decided by the route, before any work: report it for every
+      // image block, including one admission would have refused anyway.
+      blocks.push({ kind: 'text', text: `[image omitted: ${imageOmission}]` })
+      continue
+    }
+    const admittedImage = admittedByIndex.get(index)
     if (deliver === 'metadata-only' || admittedImage === undefined) {
-      const bytes = admittedImage === undefined ? 0 : Math.floor(admittedImage.data.length / 4) * 3
+      const bytes = admittedImage === undefined ? 0 : Math.floor(admittedImage.image.data.length / 4) * 3
       const hash = admittedImage === undefined
         ? 'dropped'
-        : createHash('sha256').update(admittedImage.data).digest('hex').slice(0, 16)
+        : createHash('sha256').update(admittedImage.image.data).digest('hex').slice(0, 16)
       blocks.push({
         kind: 'image-meta',
-        mimeType: admittedImage?.mimeType ?? String(block.mimeType ?? 'image/png'),
+        mimeType: admittedImage?.image.mimeType ?? String(block.mimeType ?? 'image/png'),
         bytes,
         hash,
       })
       continue
     }
-    const ref = refs[imageIndex - 1]
+    const ref = refs[admittedImage.position]
     blocks.push(ref === undefined
       ? { kind: 'text', text: `[image omitted: not stored]` }
       : { kind: 'image', attachment: ref })
   }
-  if (admitted.dropped > 0) {
+  // Suppressed when the route refused images: every image was already reported as
+  // omitted, so an admission-budget notice here would blame the wrong cause (the
+  // budget had nothing to do with it) and report the same images twice.
+  if (admitted.dropped > 0 && imageOmission === undefined) {
     blocks.push({ kind: 'text', text: `[${admitted.dropped} image(s) omitted: outside the admission budget]` })
   }
   if (blocks.length === 0) {
@@ -202,11 +244,68 @@ export async function toResultBlocks(
  * model reads, this answers what a program reads. `Object.hasOwn` rather than a
  * truthiness test, so a server that deliberately sends `structuredContent: null`
  * is still reported as having sent it.
+ *
+ * The value is NOT normalized here — use {@link toLosslessJson} before handing it
+ * to a program, which is what both call paths do.
  */
 export function providerStructuredContent(result: unknown): unknown {
   if (result === null || typeof result !== 'object') return undefined
   const envelope = result as { structuredContent?: unknown }
   return Object.hasOwn(envelope, 'structuredContent') ? envelope.structuredContent : undefined
+}
+
+/**
+ * Coerce a provider value into something a program can receive losslessly.
+ *
+ * The value arrives verbatim from the server, and an MCP reply is JSON on the wire,
+ * so `JSON.parse` can produce values the host's completion gate refuses: `1e999`
+ * becomes `Infinity`, and `-0` keeps its sign bit. Either one fails the entire run
+ * with `invalid-output: program completion must be lossless JSON`, turning a legal
+ * server reply into a dead program. Normalizing here means the program gets the
+ * data it asked for — with a non-finite number as `null`, which is what
+ * `JSON.stringify` would have produced anyway — instead of nothing at all.
+ *
+ * Values JSON cannot represent at all (functions, symbols, bigints, cycles) are
+ * dropped: an object property is omitted, an array hole becomes `null`. A value
+ * that cannot survive is never allowed to take the run down with it.
+ */
+export function toLosslessJson(value: unknown, ancestors = new Set<object>()): unknown {
+  if (value === null) return null
+  const type = typeof value
+  if (type === 'string' || type === 'boolean') return value
+  if (type === 'number') {
+    const number = value as number
+    if (!Number.isFinite(number)) return null
+    return Object.is(number, -0) ? 0 : number
+  }
+  if (type !== 'object') return undefined
+  if (ancestors.has(value as object)) return undefined
+  ancestors.add(value as object)
+  try {
+    if (Array.isArray(value)) {
+      const items: unknown[] = []
+      for (let index = 0; index < value.length; index++) {
+        const item = index in value ? toLosslessJson(value[index], ancestors) : undefined
+        items.push(item === undefined ? null : item)
+      }
+      return items
+    }
+    const prototype = Object.getPrototypeOf(value)
+    if (prototype !== Object.prototype && prototype !== null) {
+      // Not reachable from parsed JSON, but a hand-built envelope can carry one:
+      // represent it through its own `toJSON` (a Date) or drop the branch.
+      const toJSON = (value as { toJSON?: () => unknown }).toJSON
+      return typeof toJSON === 'function' ? toLosslessJson(toJSON.call(value), ancestors) : undefined
+    }
+    const plain: Record<string, unknown> = {}
+    for (const [key, held] of Object.entries(value as Record<string, unknown>)) {
+      const item = toLosslessJson(held, ancestors)
+      if (item !== undefined) plain[key] = item
+    }
+    return plain
+  } finally {
+    ancestors.delete(value as object)
+  }
 }
 
 function resolveCall(host: PtcHost, call: PtcProgramCall): { provider: ProviderConnection; operation: string } {
@@ -255,7 +354,9 @@ export async function runDirect(host: PtcHost, request: PtcProgramRequest, signa
       const provided = (call.args ?? {}) as Record<string, unknown>
       const result = await provider.call(operation, provided, signal)
       const blocks = await toResultBlocks(host, provider.id, operation, result, call.deliver ?? 'inline')
-      const data = providerStructuredContent(result)
+      // Normalized, not verbatim: see `toLosslessJson`. A server's `1e999` would
+      // otherwise reach the host gate as `Infinity` and fail the whole run.
+      const data = toLosslessJson(providerStructuredContent(result))
       calls.push({
         target: call.target,
         ...(call.title === undefined ? {} : { title: call.title }),
@@ -277,6 +378,11 @@ export async function runDirect(host: PtcHost, request: PtcProgramRequest, signa
  * Render the TypeScript source a `ctx.ptcRuntime` run would execute for this
  * batch (PTC presentation). Each call becomes one `await tools.*` line so every
  * sub-call stays visible to the harness as `tool/ptc-dispatch`.
+ *
+ * Reserved path, not wired: nothing in the mounted face calls this today (see the
+ * file header). Kept because the presentation work is planned and the rendering
+ * shape is settled; `packages/runtime/src/index.ts` exposes it as
+ * `renderProgram`.
  */
 export function buildProgram(request: PtcProgramRequest): string {
   const lines: string[] = []

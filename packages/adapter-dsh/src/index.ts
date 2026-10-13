@@ -18,7 +18,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-tools'
 import type { AttachmentStore, ImageAttachmentRef, ImageMediaType } from '@deepseek-ai/dsh-attachment'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
-import { providerStructuredContent, splitBatchTarget, splitTarget, toResultBlocks, type PtcHost } from '@lyd123qw2008/dsh-ptc-runtime'
+import { providerStructuredContent, splitBatchTarget, splitTarget, toLosslessJson, toResultBlocks, type PtcHost } from '@lyd123qw2008/dsh-ptc-runtime'
 import type { McpProviderSpec, ProviderConnection, ProviderFailure } from '@lyd123qw2008/dsh-ptc-runtime'
 import { CAP_CALL_TOOL_DESCRIPTION, CAP_HELP_TOOL_DESCRIPTION } from './descriptions.js'
 
@@ -422,27 +422,21 @@ export function createCapTools(host: PtcCapHost) {
       const refusal = await imageRouteRefusal(host, exec)
       const result = await host.call(providerId, operationName, provided, exec.signal)
       const ptcHost = asPtcHost(host)
-      const rawBlocks = await toResultBlocks(ptcHost, providerId, operationName, result, deliver)
-      const data = providerStructuredContent(result)
+      // The refusal is handed IN rather than applied afterwards: rewriting the blocks
+      // post-hoc still let `toResultBlocks` write the pixels to the attachment store
+      // first, so a text-only model left durable images behind that nothing prunes.
+      const rawBlocks = await toResultBlocks(ptcHost, providerId, operationName, result, deliver, refusal)
+      // Normalized, not verbatim: a server reply is JSON on the wire, so `1e999`
+      // parses to `Infinity` and would fail the host's completion gate, killing the
+      // run over a legal number. See `toLosslessJson`.
+      const data = toLosslessJson(providerStructuredContent(result))
       const blocks: CapBlock[] = rawBlocks.map(block => {
         if (block.kind === 'text') return block
         if (block.kind === 'image-meta') return block
         return { kind: 'image', attachment: block.attachment as unknown as ImageAttachmentRef }
       })
-      if (refusal !== undefined) {
-        // Recompute from what is actually delivered: a refused image is text now, so
-        // it must not appear in `images` either.
-        const omitted: CapBlock[] = blocks.map(block => (block.kind === 'image'
-          ? { kind: 'text', text: `[image omitted: ${refusal}]` } as const
-          : block))
-        return forToolContract({
-          provider: providerId,
-          operation: operationName,
-          blocks: omitted,
-          images: imagesOf(omitted),
-          ...data === undefined ? {} : { data },
-        } satisfies CapCallValue)
-      }
+      // `images` is derived from the blocks actually delivered, so a refused image
+      // (now text) is not counted as an image either.
       return forToolContract({
         provider: providerId,
         operation: operationName,

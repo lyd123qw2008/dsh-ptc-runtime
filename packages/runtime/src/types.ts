@@ -224,8 +224,6 @@ export interface PtcProgramRequest {
   readonly calls: readonly PtcProgramCall[]
   /** Source of the final aggregation expression, evaluated after all calls settle. */
   readonly returns?: string
-  /** Elapsed budget in milliseconds; omission uses the deployment default. */
-  readonly timeoutMs?: number
   /** Display-only label for the whole program. */
   readonly title?: string
 }
@@ -278,8 +276,6 @@ export type ProviderConnector = (spec: McpProviderSpec) => Promise<ProviderConne
 
 export interface RuntimeOptions {
   readonly providers: readonly McpProviderSpec[]
-  /** Default per-program budget; the PTC default applies when omitted. */
-  readonly programTimeoutMs?: number
   /** Override the connection step (tests). */
   readonly connector?: ProviderConnector
 }

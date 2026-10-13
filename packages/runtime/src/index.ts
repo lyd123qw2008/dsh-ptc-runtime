@@ -39,7 +39,7 @@ export {
   type ProviderImage,
   type ProviderImages,
 } from './catalog.js'
-export { buildProgram, providerStructuredContent, runDirect, splitBatchTarget, splitTarget, toResultBlocks, MAX_BATCH_TARGETS } from './ptc.js'
+export { buildProgram, providerStructuredContent, runDirect, splitBatchTarget, splitTarget, toLosslessJson, toResultBlocks, MAX_BATCH_TARGETS } from './ptc.js'
 export type { PtcHost } from './ptc.js'
 
 export interface PtcCapabilityRuntime {
@@ -58,8 +58,6 @@ export async function createCapabilityRuntime(options: RuntimeOptions): Promise<
   const connector = options.connector ?? connectMcpProvider
   const providers = new Map<string, ProviderConnection>()
   const unattached = new Map<string, { spec: McpProviderSpec; error: string }>()
-  const disabled = new Set<string>()
-  const attaching = new Map<string, Promise<ProviderConnection>>()
 
   const connect = async (spec: McpProviderSpec): Promise<ProviderConnection> => {
     const connection = await connector(spec)
@@ -68,34 +66,13 @@ export async function createCapabilityRuntime(options: RuntimeOptions): Promise<
     return connection
   }
 
-  const attach = async (id: string, url?: string): Promise<ProviderConnection> => {
-    const pending = attaching.get(id)
-    if (pending !== undefined) return pending
-    const entry = unattached.get(id)
-    if (entry === undefined) {
-      throw new Error(disabled.has(id)
-        ? `provider ${id} is configured with disabled: true`
-        : `unknown provider ${id}`)
-    }
-    const spec = url === undefined ? entry.spec : { ...entry.spec, url }
-    const attempt = connect(spec)
-      .catch((error: unknown) => {
-        const message = describeProviderError(error)
-        unattached.set(id, { spec: entry.spec, error: message })
-        console.warn(`[dsh-ptc-runtime] provider ${id} could not be attached: ${message}`)
-        throw error
-      })
-      .finally(() => { attaching.delete(id) })
-    attaching.set(id, attempt)
-    return attempt
-  }
-  void attach
-
+  // No per-provider `attach` here, though the kernel runtime has one. There it is consumed by the
+  // bridge, so a model can bring up a single provider that failed at startup (or move its URL)
+  // without disturbing the others. The PTC face exposes no such verb: recovery is
+  // `cap_help({refresh:true})`, which rebuilds every provider. Keeping a ported `attach` that
+  // nothing calls — it was referenced only by a `void attach` — reads as a capability that exists.
   await Promise.all(options.providers.map(async (spec) => {
-    if (spec.disabled === true) {
-      disabled.add(spec.id)
-      return
-    }
+    if (spec.disabled === true) return
     try {
       await connect(spec)
     } catch (error) {

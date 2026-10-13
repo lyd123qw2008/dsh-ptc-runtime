@@ -108,6 +108,16 @@ export interface ProviderImage {
 
 export interface ProviderImages {
   readonly images: readonly ProviderImage[]
+  /**
+   * Index into `content` of each admitted image, parallel to `images`.
+   *
+   * The two counters are NOT the same, and conflating them was a real bug: `images`
+   * is filtered to the admitted blocks while a reader walking `content` counts every
+   * image block. As soon as one block is refused, the sequences diverge and a
+   * position-based lookup hands each later block its neighbour's image. Carrying the
+   * source index makes the mapping explicit instead of positional.
+   */
+  readonly indexes: readonly number[]
   /** Images the server sent that admission refused. Never silent: see `mergeProviderImages`. */
   readonly dropped: number
 }
@@ -119,12 +129,13 @@ export interface ProviderImages {
  * server's reply alone, so it can be asserted without a server.
  */
 export function collectProviderImages(content: unknown): ProviderImages {
-  if (!Array.isArray(content)) return { images: [], dropped: 0 }
+  if (!Array.isArray(content)) return { images: [], indexes: [], dropped: 0 }
   const images: ProviderImage[] = []
+  const indexes: number[] = []
   let total = 0
   let dropped = 0
-  for (const raw of content) {
-    const block = raw as { type?: unknown; mimeType?: unknown; data?: unknown } | null
+  for (let index = 0; index < content.length; index++) {
+    const block = content[index] as { type?: unknown; mimeType?: unknown; data?: unknown } | null
     if (block === null || typeof block !== 'object' || block.type !== 'image') continue
     const mimeType = typeof block.mimeType === 'string' ? block.mimeType.toLowerCase() : ''
     const data = typeof block.data === 'string' ? block.data : ''
@@ -141,8 +152,9 @@ export function collectProviderImages(content: unknown): ProviderImages {
     }
     total += bytes
     images.push({ mimeType, data })
+    indexes.push(index)
   }
-  return { images, dropped }
+  return { images, indexes, dropped }
 }
 
 /**

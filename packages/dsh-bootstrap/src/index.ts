@@ -29,8 +29,6 @@ export interface PtcBootstrapConfig {
   readonly providers?: readonly McpProviderSpec[]
   /** Path to a JSON file holding the provider list (`[...]` or `{ "providers": [...] }`). */
   readonly providersFile?: string
-  /** Default per-program budget. */
-  readonly programTimeoutMs?: number
   /** Override runtime construction (tests). */
   readonly runtimeFactory?: (options: RuntimeOptions) => Promise<PtcCapabilityRuntimeLike>
 }
@@ -72,34 +70,39 @@ export function resolveProviders(
 export const apply = async (ctx: Context, config: PtcBootstrapConfig = {}): Promise<void> => {
   const providers = resolveProviders(config)
   const build = config.runtimeFactory ?? createCapabilityRuntime
-  const runtime = await build({
-    providers,
-    ...config.programTimeoutMs === undefined ? {} : { programTimeoutMs: config.programTimeoutMs },
-  })
+  // No program-timeout option here on purpose. In the kernel runtime the cell budget was this
+  // layer's to own (`cellTimeoutMs` -> `defaultTimeoutMs`), but under PTC the deadline belongs to
+  // DSH's `run_code` (`timeoutMs`, default 120s, capped by the deployment) and reaches the child
+  // through `ctx.ptcRuntime`. A second budget here would be a knob that changed nothing — which is
+  // exactly what the `programTimeoutMs` field this replaces had become.
+  const buildOptions = () => ({ providers })
+  // The live runtime, swapped by `refresh`. Held in a variable rather than read
+  // through a fixed reference so an adoption changes what every host hook sees.
+  let current = await build(buildOptions())
 
   const host: PtcCapHost = {
-    providers: () => runtime.catalog(),
-    failures: () => runtime.failures(),
+    providers: () => current.catalog(),
+    failures: () => current.failures(),
     spec: id => providers.find(candidate => candidate.id === id),
     // The runtime reconnects its own live sessions on demand, so a catalog read
     // needs a new handshake rather than a snapshot: what a model reads is what
-    // the servers advertise now. In-flight calls do not survive this — documented.
+    // the servers advertise now. Rebuilding also retries providers that failed to
+    // attach at mount, which is the only way `refresh` can pick one up. In-flight
+    // calls do not survive this — documented.
     refresh: async () => {
-      for (const connection of runtime.catalog()) await connection.close().catch(() => {})
-      const rebuilt = await build({
-        providers,
-        ...config.programTimeoutMs === undefined ? {} : { programTimeoutMs: config.programTimeoutMs },
-      })
-      // Swap in the rebuilt catalog/failures; the old runtime stays open only to
-      // release anything `close()` left behind.
-      Object.assign(runtime, {
-        catalog: rebuilt.catalog,
-        failures: rebuilt.failures,
-      })
-      void rebuilt.dispose()
+      const previous = current
+      const rebuilt = await build(buildOptions())
+      // Adopt first, dispose second — and dispose the OUTGOING runtime, never the
+      // incoming one. `catalog` closes over the runtime's own provider map, so
+      // disposing the rebuilt runtime closes exactly the connections just adopted:
+      // the catalog would still list every provider while every call failed with
+      // "has no open session". Disposing `previous` instead reaps the sessions being
+      // replaced (including stdio children) and leaves the new ones untouched.
+      current = rebuilt
+      await previous.dispose().catch(() => {})
     },
     call: async (provider, operation, args, signal) => {
-      const connection = runtime.catalog().find(candidate => candidate.id === provider)
+      const connection = current.catalog().find(candidate => candidate.id === provider)
       if (connection === undefined) throw new Error(`provider "${provider}" is not attached`)
       return await connection.call(operation, args, signal)
     },
@@ -110,10 +113,13 @@ export const apply = async (ctx: Context, config: PtcBootstrapConfig = {}): Prom
   const disposers = createCapTools(host).map(definition => ctx.tools.register(definition))
   ctx.effect(() => () => {
     for (const dispose of [...disposers].reverse()) dispose()
-  }, 'dsh-ptc-runtime: unregister cap_help/cap_call')
+    // Closing the sessions is the other half of unmounting: without it a stdio
+    // provider keeps its child process running for the life of the host process.
+    void current.dispose().catch(() => {})
+  }, 'dsh-ptc-runtime: unregister cap_help/cap_call and close provider sessions')
 
-  const report = runtime.catalog().map(provider => `${provider.id}=${provider.operations.length}`).join(' ') || 'no connected providers'
-  const notAttached = runtime.failures().map(failure => failure.id)
+  const report = current.catalog().map(provider => `${provider.id}=${provider.operations.length}`).join(' ') || 'no connected providers'
+  const notAttached = current.failures().map(failure => failure.id)
   const disabled = providers.filter(spec => spec.disabled === true).map(spec => spec.id)
   console.log(
     `[dsh-ptc-runtime] mounted ${report}`
